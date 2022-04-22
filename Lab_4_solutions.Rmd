@@ -1,0 +1,236 @@
+---
+title: 'Quantitative Text Analysis - Day 4: Machine Learning'
+author: "Bruno Castanho Silva"
+date: "4/21/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## House of Commons polarization
+
+```{r warning  = F, message=F}
+library(quanteda)
+library(tidyverse)
+```
+
+
+Today we'll look at a corpus with speeches in the House of Commons between 1988 and 2019. The entire corpus (from the Parlspeech v2 dataset, by Rauh and Schwalbach) comprises more than 1.3 million speeches, and this is a random sample from it. You have to download it from the following link, because it's too large for github: https://www.dropbox.com/s/e44ryudpfzipsl8/UK_corpus_short.RData?dl=1. Put it into the folder with the script and load it.
+
+```{r}
+load('UK_corpus_short.RData')
+```
+
+Peterson and Spirling (2018, https://doi.org/10.1017/pan.2017.39) apply machine learning to a corpus of UK speeches for a much longer period, and showed that the accuracy of classifiers is indicative of political polarization. The intuition is that, the easier it is for an algorithm to tell apart speeches given by Conservative or Labour MPs purely based on text, the more differently these MPs speak, and thus the higher is political polarization. We will try reproducing their analysis, for the 30-year period of our speeches. 
+
+Let's start by introducing a variable that distinguishes the different legislative periods in our data. The legislative term that went from the 2017  general elections until the Dec 2019 snap elections was the 57th parliament, so that's where the numbers come from.
+
+```{r}
+uk <- mutate(uk , leg_term = case_when(date2 >= 20170621 ~ 57,
+                                                date2 < 20170621 & date2 >= 20150527 ~ 56,
+                                                date2 < 20150527 & date2 >= 20100518 ~ 55,
+                                                date2 < 20100518 & date2 >= 20050505 ~ 54,
+                                                date2 < 20050505 & date2 >= 20010601 ~ 53,
+                                                date2 < 20010601 & date2 >= 19970514 ~ 52,
+                                                date2 < 19970514 & date2 >= 19920427 ~ 51,
+                                                date2 < 19920427 ~ 50),
+                  year = as.numeric(str_sub(date, 1,4)))
+
+table(uk$leg_term)
+```
+
+
+We start with fitting a model for the 57th legislature. This was one centered on Brexit, and we may expect quite high levels of polarization here. It's necessary to convert all to a dfm, and remove punctuation, numbers, and stopwords.
+
+```{r}
+uk.dfm <- dfm(tokens_select(tokens(corpus(uk, text_field = 'text'), remove_punct = T, remove_numbers = T), 
+                            pattern = stopwords("en"), selection = "remove"))
+
+```
+
+First, we must select a training and a validation sets. A decent rule of thumb is around a 75-25 split for it if you don't have too large a corpus (try keeping as many obs to train an accurate model as possible), but in this case we have a large enough number of splits that we could try going for a 66-33. If we have a really large corpus we can even go for a small proportion in the training set (say, 20,000 training labelled tweets to classify another one million unlabelled ones). And set a seed for doing it.
+
+
+```{r}
+set.seed(42)
+
+uk.57 <- dfm_subset(uk.dfm, leg_term == 57)
+
+# Sample without replacement
+train.obs <- sample(docnames(uk.57), 6500, rep=F)
+
+# The ! indicates negation, so it selects all docs that are NOT in the train.obs vector for the validate set
+uk.57.train <- dfm_subset(uk.57, docnames(uk.57) %in% train.obs)
+uk.57.validate <- dfm_subset(uk.57, ! docnames(uk.57) %in% train.obs)
+```
+
+The package for ridge/lasso/elastic net regressions in R is called `glmnet`. It gives two options for fitting the models, one with the simple `glmnet` command, and the other called `cv.glmnet`, which automatically applies a techinique called k-fold cross validation to train the model, in order to reduce overfitting. The definition of whether we train a Ridge, a Lasso, or combination of both is given by the argument `alpha`: 1 is a lasso, 0 Ridge, and anything in between is an elastic net combining both. If we want to tune that and find the best value, it's necessary to do by hand. Here, we'll just try the two. 
+
+Starting with a lasso regression on the training data. We redefine conservative = 1 and Lab = 0 so we know what goes in the logit model. In the `cv.glmnet` function itself, we pass the dfm as `x`, which are the features (or independent variables), and the labels as `y`.
+
+
+```{r warning = F, message = F}
+library(glmnet)
+
+docvars(uk.57.train)$Con <- ifelse(docvars(uk.57.train)$party == 'Con', 1, 0)
+
+lasso.fit <- cv.glmnet(x = uk.57.train,
+y = docvars(uk.57.train)$Con,
+alpha = 1, 
+family='binomial')
+```
+
+The plot function will produce this plot below. This plot shows the error (here denoted as deviance) for each value of lambda (on the bottom part of the x axis). Each value of lambda corresponds to a different model, each with a number of variables left and used in the model (top x-axis): for
+example, if log(lambda) is -6, the model has 3120 variables(words), and the others were removed, with coefficients set to
+zero. The range in between vertical dashed lines shows the values of lambda that give the lowest error - both to the left and the right of it, the model has higher error - i.e., it didn't remove enough variables(words) (left), or removed too many (right).
+
+```{r}
+plot(lasso.fit)
+```
+
+To check the performance in a more intuitive way, we can look at the 2x2 table for the classification. We use the `predict` function, giving it first the model used to make predictions (`lasso.fit`), for the `newx` we have to give the matrix with features that the predictions will be based on. We pass again here the training set, so that we are using the model to make predictions for the training observations. The `s` argument is where we indicate the value of lambda that should be used. In this case, we take the value of lambda that was associated with the lowest error among all tried, which we access from the `lasso.fit` object itself through `lasso.fit$lambda.min`. And finally, with `type = 'class'` we say we want classifications (i.e., 1's and 0's) and not predicted probabilities or log odds.
+
+```{r}
+train.preds <- predict(lasso.fit,newx=uk.57.train, s=lasso.fit$lambda.min, type = 'class')
+
+table(train.preds, docvars(uk.57.train)$Con)
+```
+
+There are a few metrics one can use to evaluate these models' performance. There are a few standard metrics in machine learning. Sensitivity (or recall) indicates, of all speeches that were given by Conservatives, how many did we correctly identified (i.e., how many did our model manage to recall). Precision indicates, of all speeches labelled as Conservative, how many are correct? It evaluates whether we don't have too many false positives. For instance, a very lazy model that said all speeches were given by Conservatives would have perfect recall - it correctly recalled all of them - but it would have bad precision, because it would have a lot of false positives. The F1 score is a harmonic mean between the two, and is one of the standard measures for evaluating predictive accuracy in machine learning:
+
+```{r message = F}
+library(MLmetrics)
+
+Sensitivity(y_true = docvars(uk.57.train)$Con, y_pred = train.preds, positive = 1)
+Precision(y_true = docvars(uk.57.train)$Con, y_pred = train.preds, positive = 1)
+F1_Score(y_true = docvars(uk.57.train)$Con, y_pred = train.preds, positive = 1)
+```
+
+
+Let's see if a Ridge reduces the number of false positives. Here we switch alpha to 0, and the rest is the same.
+
+```{r}
+ridge.fit <- cv.glmnet(x = uk.57.train,
+y = docvars(uk.57.train)$Con,
+alpha = 0,
+family='binomial')
+
+ridge.train.preds <- predict(ridge.fit,newx=uk.57.train, s=ridge.fit$lambda.min, type = 'class')
+
+table(ridge.train.preds, docvars(uk.57.train)$Con)
+```
+
+That looks better. Our metrics confirm that:
+
+```{r}
+Sensitivity(y_true = docvars(uk.57.train)$Con, y_pred = ridge.train.preds, positive = 1)
+Precision(y_true = docvars(uk.57.train)$Con, y_pred = ridge.train.preds, positive = 1)
+F1_Score(y_true = docvars(uk.57.train)$Con, y_pred = ridge.train.preds, positive = 1)
+```
+
+
+Now we can check the performance on our validation set of each model:
+
+```{r}
+lasso.validate.preds <- predict(lasso.fit, newx=uk.57.validate, s = lasso.fit$lambda.min, type = 'class')
+ridge.validate.preds <- predict(ridge.fit,newx=uk.57.validate, s=ridge.fit$lambda.min, type = 'class')
+
+docvars(uk.57.validate)$Con <- ifelse(docvars(uk.57.validate)$party == 'Con', 1, 0)
+
+table(lasso.validate.preds, docvars(uk.57.validate)$Con)
+table(ridge.validate.preds, docvars(uk.57.validate)$Con)
+```
+
+Naturally worse than the training set. Let's see what the F1 scores say: 
+
+```{r}
+F1_Score(y_true = docvars(uk.57.validate)$Con, y_pred = lasso.validate.preds, positive = 1)
+F1_Score(y_true = docvars(uk.57.validate)$Con, y_pred = ridge.validate.preds, positive = 1)
+```
+
+Lasso a bit better, but not by too much.
+
+### Task 1
+
+Use these models to make predictions for speeches in the other legislative periods. How does the accuracy vary over time? Does it match what we would expect in terms of polarization in British politics over the last 3 decades?
+
+```{r}
+# First we can just use the models to make predictions for the entire rest of the corpus:
+
+uk.rest <- dfm_subset(uk.dfm, leg_term != 57)
+docvars(uk.rest)$Con <- ifelse(docvars(uk.rest)$party == 'Con', 1, 0)
+
+preds.rest.l <- predict(lasso.fit, newx = uk.rest, s = lasso.fit$lambda.min, type = 'class')
+preds.rest.r <- predict(ridge.fit, newx = uk.rest, s = ridge.fit$lambda.min, type = 'class')
+
+## Now let's calculate an F1 score for each 
+
+# First bring together the necessary information into a single dataframe (predictions from lasso, ridge, true value, legislative term:)
+df.val <- data.frame(pred.l  = preds.rest.l, pred.r = preds.rest.r, party = docvars(uk.rest)$Con, leg = docvars(uk.rest)$leg_term) 
+
+# Check that it worked (and notice column names, they'll be important)
+
+head(df.val)
+
+# Then use tidyverse to group by legislature, the summarise function to calculate F1 score for each metric within each legislature, and then ggplot to plot it over time:
+
+df.val %>% group_by(leg) %>%
+  summarise(f1.lasso = F1_Score(y_true = party, y_pred = s1, positive = 1),
+            f1.ridge = F1_Score(y_true = party, y_pred = s1.1, positive = 1)) %>%
+  ggplot(aes(x = leg, y = f1.lasso)) + geom_line() + 
+  geom_line(aes(x = leg, y = f1.ridge), color = 'red') + theme_minimal()
+
+```
+
+### Task 2 
+
+What happens if we don't cut the data by legislature, but rather take a general sample of speeches from the entire corpus to train the models? Does the training and validation set accuracy goes up?
+
+```{r}
+# Let's now take a sample of 6500 from the entire corpus:
+
+set.seed(123)
+train.obs2 <- sample(docnames(uk.dfm), 6500, rep=F)
+
+uk.dfm$Con <- ifelse(docvars(uk.dfm)$party == 'Con', 1, 0)
+
+# Create training and validation sets:
+uk.train <- dfm_subset(uk.dfm, docnames(uk.dfm) %in% train.obs)
+uk.validate <- dfm_subset(uk.dfm, ! docnames(uk.dfm) %in% train.obs)
+
+# Now fit the models:
+lasso.fit.all <- cv.glmnet(x = uk.train,
+y = docvars(uk.train)$Con,
+alpha = 1, 
+family='binomial')
+
+ridge.fit.all <- cv.glmnet(x = uk.train,
+y = docvars(uk.train)$Con,
+alpha = 0, 
+family='binomial')
+
+# Predict for all other speeches:
+lasso.all.preds <- predict(lasso.fit, newx=uk.validate, s = lasso.fit$lambda.min, type = 'class')
+ridge.all.preds <- predict(ridge.fit,newx=uk.validate, s=ridge.fit$lambda.min, type = 'class')
+
+# F1 Scores:
+F1_Score(y_true = docvars(uk.validate)$Con, y_pred = lasso.all.preds, positive = 1)
+F1_Score(y_true = docvars(uk.validate)$Con, y_pred = ridge.all.preds, positive = 1)
+```
+
+Not great performance. Probably 6500 are too few speeches, since vocabulary changes a lot over thirty years.
+
+# Interpreting
+
+Now, a nice feature of the glmnet is its interpretability. We can get the coefficients associated with each word, extracted from the glmnet object.
+
+In the code below, the first line is checking which is the row number, within the glmnet object (glmnet.fit), that gave the best performance. This is not the value of lambda itself, but only the index to find it in that object. Another part of the glmnet.fit object are the vectors of coefficients, `beta` - we have one vector for each of the 100 values of lambda tried. Line two selects only the coefficients from the model with the value of lambda that give the best performance. Line three then shows us the coefficients, and associated words, that have the 20 highest absolute values (meaning, most positive coefficients in the regression). We do so by ordering the coefficients with order(), from highest to lowest, and picking the top 20. In human words, these are the words that make a speech most likely to be given by a Tory MP (at least between 2017 and 2019). Does it make sense to you? 
+
+```{r}
+small.lambda.index <- which(lasso.fit$lambda == lasso.fit$lambda.min)
+small.lambda.betas <- lasso.fit$glmnet.fit$beta[,small.lambda.index]
+small.lambda.betas[order(-small.lambda.betas)][1:20]
+```
+
