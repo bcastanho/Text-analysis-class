@@ -1,0 +1,155 @@
+---
+title: 'Quantitative Text Analysis \nDay 3 - Scaling with Wordfish and Wordscores'
+author: "Bruno Castanho Silva"
+date: \today
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Today we start by going back to the democratic primary debate. We'll load again the transcript, and apply the same functions to clean up the dataset, in order to have at the end a dfm with speeches by candidate:
+
+```{r warning = F, message = F}
+library(quanteda)
+library(readtext)
+dem_debate <- readtext(file = "transcript_debate3.txt",encoding="UTF-8")
+
+speakers <- c("STEPHANOPOULOS","ANNOUNCER","BIDEN","WARREN",
+              "SANDERS","HARRIS","YANG","BOOKER","O'ROURKE","KLOBUCHAR",
+              "CASTRO","RAMOS","BUTTIGIEG")
+
+for(i in speakers){
+  dem_debate$text <- gsub(i,paste0("##",i),dem_debate$text)
+}
+
+dem_debate_corp <- corpus_segment(corpus(dem_debate), "##*")
+
+colnames(docvars(dem_debate_corp)) <- 'Name'
+docvars(dem_debate_corp)$Name <- gsub("##","", docvars(dem_debate_corp)$Name)
+docvars(dem_debate_corp)$Name <- gsub(":","", docvars(dem_debate_corp)$Name)
+
+dem_debate_corp <- corpus_subset(dem_debate_corp, ! Name %in% c('STEPHANOPOULOS','ANNOUNCER','RAMOS'))
+
+tok.debate <- tokens_select(tokens(dem_debate_corp, remove_punct = T, remove_numbers = T), pattern = stopwords("en"), selection = "remove")
+```
+
+We're interested in scaling the candidates in relation to each other, not necessarily each individual intervention by each one of them. For this reason, let's create the grouped dfm where each row contains all words by each candidate in all their interventions:
+
+```{r}
+dfm.debate <- dfm(tok.debate) %>%
+  dfm_group(groups = Name)
+
+```
+
+## Wordscores
+
+Wordscores requires us to define the extremes of the scale. For the left side, that would probably be Bernie, but on the right it's a bit less clear. Let's see how it goes if we set Yang as the most right-wing candidate. The function to run a Wordscores model is present in the `quanteda.textmodels` package (you have to install it separately if you haven't).
+
+We need to tell it in a rather clunky way which ones are the reference texts, and what's their value. Basically, on the argument `y` we have to put a vector where we tell it what's the score associated with each document in the `dfm` (each of the ten speakers) in the order they appear. Those we want to scale are set to `NA`, and here we say the most right (let's say that's Harris) is a 1, the most left is a -1 (Bernie). 
+
+To do that, we can use the `case_when` function, to assign a value of NA for everyone other than SANDERS, who gets a -1, and HARRIS who gets a 1:
+
+```{r message = F, warning = F}
+library(quanteda.textmodels)
+library(tidyverse)
+
+scores <- case_when(docnames(dfm.debate) == 'SANDERS' ~ -1,
+                    docnames(dfm.debate) == 'HARRIS' ~ 1,
+                             T ~ NA_real_)
+
+scores
+
+ws.debate <- textmodel_wordscores(dfm.debate, y = scores, scale = 'linear')
+```
+
+The function fits the model, based on the two extreme examples, and returns a word score for each word. We can check the first thirty here (you can ignore the candidate NA scores in this output):
+
+```{r}
+ws.debate
+```
+
+To scale the remaining candidates then, we use the `predict` function. We can ask for standard errors, and use the Martin/Vanberg 2007 rescaling method, so that scores between reference texts and the scaled ones can be compared:
+
+```{r}
+ws.debate.pred <- data.frame(predict(ws.debate,se.fit=T,
+                                      interval="confidence",rescaling="mv"))
+
+ws.debate.pred
+```
+
+It's easier to plot it:
+
+```{r}
+ws.debate.pred$Name <- docvars(dfm.debate)$Name
+
+ggplot(data=ws.debate.pred,aes(x=fit.fit,xmin=fit.lwr,
+                                xmax=fit.upr,
+                                y=reorder(Name,fit.fit)))+
+  geom_errorbarh(height=0,size=3) + theme_minimal() + ylab(NULL) + xlab('Fit')
+```
+
+While Biden right in the middle might make sense, we'd expect a few others to be placed differently - for example, Warren to be closer to Sanders. Try changing the reference texts and see if/how results change.
+
+
+## Wordfish
+
+This example shows one problem with wordscores: it hinges upon what texts are chosen as reference. Wordfish solves that, by scaling without having to define those. We run it with the, you guessed it, `textmodel_wordfish` function from the `quanteda.textmodels` package:
+
+```{r}
+wf.debate <- textmodel_wordfish(dfm.debate)
+
+wf.debate
+```
+
+Yeah, not super informative. Let's plot the predictions for each candidate:
+
+```{r}
+wf.debate.pred <- data.frame(predict(wf.debate, interval = 'confidence'))
+wf.debate.pred$Name <- docvars(dfm.debate)$Name
+
+ggplot(data=wf.debate.pred,aes(x=fit.fit,y=reorder(Name,fit.fit),
+                               xmin=fit.lwr,
+                                xmax=fit.upr))+
+  geom_pointrange(size=1)+labs(x="Position",y="")+theme_minimal()
+```
+
+These are interesting results, as one wouldn't necessarily expect Yang to be most on the left. Let's extract the predictive words and look at the most positive and most negative to try and make sense of what's going on. What do you think they indicate? What patterns appear?
+```{r}
+words <- data.frame(word = wf.debate$features,
+                    beta = wf.debate$beta)
+head(words[order(words$beta),],20)
+head(words[order(words$beta,decreasing = T),],20)
+```
+
+The next function creates the typical Eiffel Tower plot. The y-axis are the frequencies, and the x-axis the estimated beta -- words to the right mean they are more positive (upper end of the scale, O'Rourke), words to the left, more to the negative end of the scale.   
+
+
+```{r}
+library(quanteda.textplots)
+textplot_scale1d(wf.debate, margin = "features",
+                 highlighted = c('battlefield','death','weapon','ar-15',
+                                 'politician','chinese','data','dollars','benefits','people','texas'))
+```
+
+## Challenge
+
+Quanteda comes with a corpus of all inauguration speeches by all US presidents from George Washington until Biden. You can access the corpus with the code `inaug <- data_corpus_inaugural`. Try fitting a Wordfish model to all the inaugural speeches, and check the outcome. What is the dimension being captured?
+
+```{r}
+inaug <- data_corpus_inaugural
+
+in.dfm <- dfm(tokens(inaug, remove_punct = T, remove_numbers = T))
+
+wf.inaug <- textmodel_wordfish(in.dfm)
+
+wf.inaug.pred <- data.frame(predict(wf.inaug, interval = 'confidence'))
+wf.inaug.pred$Pres <- docvars(in.dfm)$President
+
+ggplot(data=wf.inaug.pred,aes(x=fit.fit,y=reorder(Pres,fit.fit),
+                               xmin=fit.lwr,
+                                xmax=fit.upr))+
+  geom_pointrange(size=1)+labs(x="Position",y="")+theme_minimal()
+```
+
